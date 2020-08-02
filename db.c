@@ -64,7 +64,10 @@ const uint32_t COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_
 
 const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
 
+//node头大小＋leaf_node_num_cells_size
 const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+
+
 //pager以文件为存储方式
 //以页为基本单位存储数据
 Pager * pager_open(const char * filename){
@@ -158,7 +161,9 @@ void initialize_leaf_node(void * node){
   *leaf_node_next_leaf(node) = 0;
 }
 
-//
+//实例化table和pager
+//如果db为空则顺便设置根节点
+//db结构为b-树
 Table * db_open(const char * filename){
   Pager * pager = pager_open(filename);
 
@@ -167,6 +172,7 @@ Table * db_open(const char * filename){
   table->root_page_num = 0;
 
   //如果pager中没有数据
+  //该page为根节点
   if(pager->num_pages == 0){
     void * root_node = get_page(pager, 0);
     initialize_leaf_node(root_node);
@@ -174,6 +180,74 @@ Table * db_open(const char * filename){
   }
 
   return table;
+}
+
+InputBuffer * new_input_buffer() {
+  InputBuffer * input_buffer = malloc(sizeof(InputBuffer));
+  input_buffer->buffer = NULL;
+  input_buffer->buffer_length = 0;
+  input_buffer->input_length = 0;
+
+  return input_buffer;
+}
+
+void print_prompt(){ printf("db > ");}
+
+//getline获取输入行
+//here could be hacked 
+void read_input(InputBuffer* input_buffer){
+  ssize_t bytes_read = 
+    getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
+  
+  input_buffer->input_length = bytes_read - 1;
+  input_buffer->buffer[bytes_read - 1] = 0;
+}
+
+//释放堆空间
+void close_input_buffer(InputBuffer* input_buffer){
+  free(input_buffer->buffer);
+  free(input_buffer);
+}
+
+//把堆上的数据写到文件中
+void pager_flush(Pager* pager, uint32_t page_num){
+  if(pager->pages[page_num] == NULL){
+    printf("flush null page\n");
+    exit(EXIT_FAILURE);
+  }
+
+  off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+
+  if(offset == -1){
+    printf("seek error\n");
+    exit(EXIT_FAILURE);
+  }
+
+  ssize_t bytes_written = write(pager->file_descriptor , pager->pages[page_num], PAGE_SIZE);
+
+  if(bytes_written == -1){
+    printf("flush error\n");
+    exit(EXIT_FAILURE);
+  }
+}
+
+void db_close(Table* table){
+  Pager* pager = table->pager;
+
+  for(uint32_t i = 0; i< pager->num_pages; i++){
+    if(pager->pages[i] == NULL){
+      continue;
+    }
+    pager_flush(pager, i);
+  }
+}
+
+MetaCommandResult do_meta_command(InputBuffer * input_buffer, Table * table){
+  if(strcmp(input_buffer->buffer, ".exit") == 0){
+    close_input_buffer(input_buffer);
+    db_close(table);
+    exit(EXIT_SUCCESS);
+  }
 }
 
 int main(int argc, char * argv[]){
@@ -184,6 +258,20 @@ int main(int argc, char * argv[]){
 
   char * filename = argv[1];
   Table* table = db_open(filename);
+
+  InputBuffer * input_buffer = new_input_buffer();
+  while(true){
+    print_prompt();
+    read_input(input_buffer);
+
+    if(input_buffer->buffer[0] == '.'){
+      switch(do_meta_command(input_buffer, table)) {
+
+      }
+    }
+
+
+  }
 
 
 }
