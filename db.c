@@ -24,6 +24,8 @@ typedef enum {
   META_COMMAND_UNRECOGNIZED_COMMAND,
 } MetaCommandResult;
 
+typedef enum {NODE_INTERNAL, NODE_LEAF}  NodeType;
+
 #define TABLE_MAX_PAGES 100
 
 typedef struct {
@@ -45,8 +47,118 @@ typedef struct {
   bool end_of_table;
 } Cursor;
 
+const uint32_t PAGE_SIZE = 4094U;
+//节点类型,中间节点，叶子节点
+const uint32_t NODE_TYPE_OFFSET = 0;
+const uint32_t IS_ROOT_OFFSET = NODE_TYPE_OFFSET;
+
+const uint32_t NODE_TYPE_SIZE = sizeof(uint8_t);
+const uint32_t IS_ROOT_SIZE = sizeof(uint8_t);
+const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t);
+
+const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
 
 
+//节点类型＋是否根节点＋父亲指针大小
+const uint32_t COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+
+const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+//pager以文件为存储方式
+//以页为基本单位存储数据
+Pager * pager_open(const char * filename){
+  int fd = open(filename, O_RDWR|O_CREAT, S_IWUSR|S_IRUSR);
+
+  if(fd == -1){
+    printf("unable to open the file\n");
+    exit(EXIT_FAILURE);
+  }
+  
+  off_t file_length = lseek(fd, 0, SEEK_END);
+
+  Pager* pager = malloc(sizeof(Pager));
+  pager->file_descriptor = fd;
+  pager->file_length = file_length;
+  pager->num_pages = file_length/PAGE_SIZE;
+
+  if(file_length / PAGE_SIZE != 0){
+    printf("必须是4096整数倍\n");
+    exit(EXIT_FAILURE);
+  }
+
+  for(uint32_t i = 0; i< TABLE_MAX_PAGES; i++){
+    pager->pages[i] = NULL;
+  }
+
+  return pager;
+}
+
+//返回的pager->page[]数组存的是堆地址初始值
+//如果该页不存在则申请4096空间，否则直接返回
+void * get_page(Pager* pager, uint32_t page_num){
+  if(page_num > TABLE_MAX_PAGES){
+    printf("最多100个page\n");
+    exit(EXIT_FAILURE);
+  }
+
+  if(pager->pages[page_num] == NULL){
+    void * page = malloc(PAGE_SIZE);
+    uint32_t num_pages = pager->file_length / PAGE_SIZE;
+
+    if(pager->file_length % PAGE_SIZE){
+      num_pages += 1;
+    }
+
+    if(page_num < num_pages){
+      lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+      ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+      if(bytes_read == -1){
+        printf("读文件错误\n");
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    pager->pages[num_pages] = page;
+
+    if(page_num > pager->num_pages){
+      pager->num_pages = page_num + 1;
+    }
+
+    return pager->pages[num_pages];
+  }
+}
+
+//Page堆空间开始８字节为节点类型
+//标为中间节点或者叶子节点
+void set_node_type(void * node, NodeType type){
+  uint8_t value = type;
+  *((uint8_t *) (node + NODE_TYPE_OFFSET)) = value;
+}
+
+//表明该页是不是根节点
+void set_node_root(void * node, bool is_root){
+  uint8_t value = is_root;
+  *((uint8_t *) (node + IS_ROOT_OFFSET)) = value;
+}
+
+uint32_t* leaf_node_num_cells(void * node){
+  return node + LEAF_NODE_NUM_CELLS_OFFSET;
+}
+
+uint32_t * leaf_node_next_leaf(void * node){
+  return node + LEAF_NODE_NEXT_LEAF_OFFSET;
+}
+
+//node是堆起始地址值
+void initialize_leaf_node(void * node){
+  set_node_type(node, NODE_LEAF);
+  set_node_root(node, false);
+  *leaf_node_num_cells(node) = 0;
+  *leaf_node_next_leaf(node) = 0;
+}
+
+//
 Table * db_open(const char * filename){
   Pager * pager = pager_open(filename);
 
@@ -54,6 +166,14 @@ Table * db_open(const char * filename){
   table->pager = pager;
   table->root_page_num = 0;
 
+  //如果pager中没有数据
+  if(pager->num_pages == 0){
+    void * root_node = get_page(pager, 0);
+    initialize_leaf_node(root_node);
+    set_node_root(root_node, true);
+  }
+
+  return table;
 }
 
 int main(int argc, char * argv[]){
