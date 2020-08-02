@@ -47,25 +47,105 @@ typedef struct {
   bool end_of_table;
 } Cursor;
 
+#define COLUMN_USERNAME_SIZE 32
+#define COLUMN_EMAIL_SIZE 255
+
+typedef struct {
+  uint32_t id;
+  char username[COLUMN_USERNAME_SIZE+1];
+  char email[COLUMN_EMAIL_SIZE+1];
+}Row;
+
+typedef enum {STATEMENT_INSERT, STATEMENT_SELECT} StatementType;
+
+typedef struct {
+  StatementType type;
+  Row row_to_insert;
+}Statement;
+
+typedef enum {
+  PREPARE_SUCCESS,
+  PREPARE_NEGATIVE_ID,
+  PREPARE_STRING_TOO_LONG,
+  PREPARE_SYNTAX_ERROR,
+  PREPARE_UNRECOGNIZE_STATEMENT
+} PrepareResult;
+
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct *)0) ->Attribute);
+
+const uint32_t ID_SIZE = size_of_attribute(Row, id);
+const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
+const uint32_t EMAIL_SIZE  = size_of_attribute(Row, email);
+const uint32_t ID_OFFSET = 0;
+const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
+const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
+const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+
+
 const uint32_t PAGE_SIZE = 4094U;
-//节点类型,中间节点，叶子节点
-const uint32_t NODE_TYPE_OFFSET = 0;
-const uint32_t IS_ROOT_OFFSET = NODE_TYPE_OFFSET;
-
+/*
+ * Common Node Header Layout
+ */
+//节点类型，是否是根节点，父亲节点
 const uint32_t NODE_TYPE_SIZE = sizeof(uint8_t);
+const uint32_t NODE_TYPE_OFFSET = 0;
 const uint32_t IS_ROOT_SIZE = sizeof(uint8_t);
+const uint32_t IS_ROOT_OFFSET = NODE_TYPE_SIZE;
 const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t);
+const uint32_t PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const uint8_t COMMON_NODE_HEADER_SIZE =
+    NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
 
+/*
+ * Internal Node Header Layout
+ */
+//中间节点关键字个数，中间节点右孩子
+const uint32_t INTERNAL_NODE_NUM_KEYS_SIZE = sizeof(uint32_t);
+const uint32_t INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const uint32_t INTERNAL_NODE_RIGHT_CHILD_SIZE = sizeof(uint32_t);
+const uint32_t INTERNAL_NODE_RIGHT_CHILD_OFFSET =
+    INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE;
+const uint32_t INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
+                                           INTERNAL_NODE_NUM_KEYS_SIZE +
+                                           INTERNAL_NODE_RIGHT_CHILD_SIZE;
+
+/*
+ * Internal Node Body Layout
+ */
+//
+const uint32_t INTERNAL_NODE_KEY_SIZE = sizeof(uint32_t);
+const uint32_t INTERNAL_NODE_CHILD_SIZE = sizeof(uint32_t);
+const uint32_t INTERNAL_NODE_CELL_SIZE =
+    INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
+/* Keep this small for testing */
+const uint32_t INTERNAL_NODE_MAX_CELLS = 3;
+
+/*
+ * Leaf Node Header Layout
+ */
 const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
-
-
-//节点类型＋是否根节点＋父亲指针大小
-const uint32_t COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
-
 const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
-
-//node头大小＋leaf_node_num_cells_size
+const uint32_t LEAF_NODE_NEXT_LEAF_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
+                                       LEAF_NODE_NUM_CELLS_SIZE +
+                                       LEAF_NODE_NEXT_LEAF_SIZE;
+
+/*
+ * Leaf Node Body Layout
+ */
+const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_KEY_OFFSET = 0;
+const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
+const uint32_t LEAF_NODE_VALUE_OFFSET =
+    LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_MAX_CELLS =
+    LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;
+const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT =
+    (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
 
 
 //pager以文件为存储方式
@@ -239,7 +319,111 @@ void db_close(Table* table){
       continue;
     }
     pager_flush(pager, i);
+    free(pager->pages[i]);
+    pager->pages[i] = NULL;
   }
+
+  int result = close(pager->file_descriptor);
+  if(result == -1){
+    printf("ERROR CLOSING DB\n");
+    exit(EXIT_FAILURE);
+  }
+  for(uint32_t i = 0; i<TABLE_MAX_PAGES; i++){
+    void * page = pager->pages[i];
+    if(page){
+      free(page);
+      pager->pages[i] = NULL;
+    }
+  }
+  free(pager);
+  free(table);
+}
+
+NodeType get_node_type(void * node){
+  uint8_t value = *((uint8_t *) (node+ NODE_TYPE_OFFSET));
+  return (NodeType)value;
+}
+
+void indent(uint32_t level){
+  for(uint32_t i = 0; i< level; i++){
+    printf("  ");
+  }
+}
+
+void * leaf_node_cell(void * node, uint32_t cell_num){
+  return node+ LEAF_NODE_HEADER_SIZE+ cell_num * LEAF_NODE_CELL_SIZE;
+}
+
+uint32_t* leaf_node_key(void* node, uint32_t cell_num){
+  return leaf_node_cell(node , cell_num);
+}
+
+uint32_t* internal_node_num_keys(void* node){
+  return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
+}
+
+uint32_t* internal_node_right_child(void* node){
+  return node + INTERNAL_NODE_RIGHT_CHILD_OFFSET;
+}
+
+uint32_t* internal_node_cell(void* node , uint32_t cell_num){
+  return node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE;
+}
+
+uint32_t* internal_node_child(void * node , uint32_t child_num){
+  uint32_t num_keys = *internal_node_num_keys(node);
+  if(child_num > num_keys){
+    printf("最多%d个孩子", num_keys);
+    exit(EXIT_FAILURE);
+  } else if(child_num == num_keys){
+    return internal_node_right_child(node);
+  } else {
+    return internal_node_cell(node, child_num);
+  }
+}
+
+uint32_t* internal_node_key(void* node, uint32_t key_num){
+  return (void*) internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
+}
+//
+void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level){
+  void * node = get_page(pager, page_num);
+  uint32_t num_keys, child;
+
+  switch(get_node_type(node)){
+    case(NODE_LEAF):
+      num_keys = *leaf_node_num_cells(node);
+      indent(indentation_level);
+      printf("- leaf (size %d)\n", num_keys);
+      for (uint32_t i = 0; i < num_keys; i++) {
+        indent(indentation_level+1);
+        printf("- %d\n", *leaf_node_key(node, i));
+      }
+      break;
+    case(NODE_INTERNAL):
+      num_keys = *internal_node_num_keys(node);
+      indent(indentation_level);
+      printf("- internal (size %d)\n", num_keys);
+      for(uint32_t i = 0; i < num_keys ; i++){
+        child = *internal_node_child(node, i);
+        print_tree(pager, child, indentation_level+1);
+
+        indent(indentation_level+1);
+        printf(" - key %d\n", *internal_node_key(node, i));
+      }
+      child = *internal_node_right_child(node);
+      print_tree(pager, child, indentation_level+1);
+      break;
+  }
+}
+
+void print_constants(){
+  printf("ROW_SIZE: %d\n", ROW_SIZE);
+  printf("COMMON_NODE_HEAGER_SIZE: %d\n", COMMON_NODE_HEADER_SIZE);
+  printf("LEAF_NODE_HEADER_SIZE: %d\n", LEAF_NODE_HEADER_SIZE);
+  printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
+  printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
+  printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
 }
 
 MetaCommandResult do_meta_command(InputBuffer * input_buffer, Table * table){
@@ -247,8 +431,63 @@ MetaCommandResult do_meta_command(InputBuffer * input_buffer, Table * table){
     close_input_buffer(input_buffer);
     db_close(table);
     exit(EXIT_SUCCESS);
+  }else if(strcmp(input_buffer->buffer, ".btree") == 0){
+    printf("tree:\n");
+    print_tree(table->pager, 0, 0);
+    return META_COMMAND_SUCCESS;
+  }else if(strcmp(input_buffer->buffer, ".constants") == 0){
+    printf("Constants:\n");
+    print_constants();
+    return META_COMMAND_SUCCESS;
+  }else {
+    return META_COMMAND_UNRECOGNIZED_COMMAND;
   }
 }
+
+//主要是初始化statement
+PrepareResult prepare_insert(InputBuffer * input_buffer, Statement* statement){
+  statement->type = STATEMENT_INSERT;
+
+  char * keyword = strtok(input_buffer->buffer, " ");
+  char * id_string = strtok(NULL, " ");
+  char * username = strtok(NULL, " ");
+  char * email = strtok(NULL, " ");
+
+  if(id_string == NULL || username == NULL || email == NULL){
+    return PREPARE_SYNTAX_ERROR;
+  }
+
+  //可以替换为一个强转
+  int id = atoi(id_string);
+  if(id < 0){
+    return  PREPARE_NEGATIVE_ID;
+  }
+
+  if(strlen(username) > COLUMN_USERNAME_SIZE){
+    return PREPARE_STRING_TOO_LONG;
+  }
+  if(strlen(email) > COLUMN_EMAIL_SIZE){
+    return PREPARE_STRING_TOO_LONG;
+  }
+
+  statement->row_to_insert.id = id;
+  strcpy(statement->row_to_insert.username, username);
+  strcpy(statement->row_to_insert.email, email);
+
+  return PREPARE_SUCCESS;
+}
+
+PrepareResult prepare_statement(InputBuffer * input_buffer, Statement* statement){
+  if(strncmp(input_buffer->buffer, "insert", 6) == 0){
+    return prepare_insert(input_buffer, statement);
+  }
+  if(strcmp(input_buffer->buffer, "select") == 0){
+    statement->type = STATEMENT_SELECT;
+    return PREPARE_SUCCESS;
+  }
+
+  return PREPARE_UNRECOGNIZE_STATEMENT;
+} 
 
 int main(int argc, char * argv[]){
   if(argc < 2){
@@ -266,10 +505,18 @@ int main(int argc, char * argv[]){
 
     if(input_buffer->buffer[0] == '.'){
       switch(do_meta_command(input_buffer, table)) {
-
+        case(META_COMMAND_SUCCESS):
+          continue;
+        case(META_COMMAND_UNRECOGNIZED_COMMAND):
+          printf("unrecognized command '%s'\n", input_buffer->buffer);
+          continue;
       }
     }
 
+    Statement statement;
+    switch(prepare_statement(input_buffer, &statement)) {
+
+    }
 
   }
 
