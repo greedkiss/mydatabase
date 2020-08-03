@@ -586,6 +586,49 @@ uint32_t* node_parent(void* node){
   return node + PARENT_POINTER_OFFSET;
 }
 
+void* leaf_node_value(void* node, uint32_t cell_num){
+  return leaf_node_cell(node, cell_num)+ LEAF_NODE_KEY_SIZE;
+}
+
+//将Row中的信息拷贝到缓冲区pager中
+void serilaize_row(Row* resource, void* destination){
+  memcpy(destination+ ID_OFFSET, &resource->id, ID_SIZE);
+  memcpy(destination + USERNAME_OFFSET, &resource->username, USERNAME_SIZE);
+  memcpy(destination + EMAIL_OFFSET, &resource->email, EMAIL_SIZE);
+}
+
+void initialize_internal_node(void * node){
+  set_node_type(node, NODE_INTERNAL);
+  set_node_root(node, false);
+  *internal_node_num_keys(node) = 0;
+}
+
+void create_new_root(Table* table, uint32_t right_child_page_num){
+  void* root = get_page(table->pager , table->root_page_num);
+  void* right_child = get_page(table->pager, right_child_page_num);
+  uint32_t left_child_page_num = get_unused_page_num(table->pager);
+  void* left_child = get_page(table->pager, left_child_page_num);
+
+  memcpy(left_child, root, PAGE_SIZE);
+  set_node_root(left_child, false);
+
+  initialize_internal_node(root);
+  set_node_root(root, true);
+  *internal_node_num_keys(root) = 1;
+  *internal_node_child(root, 0) = left_child_page_num;
+  uint32_t left_child_max_key = get_node_max_key(left_child);
+  *internal_node_key(root, 0) = left_child_max_key;
+  *internal_node_right_child(root) = right_child_page_num;
+  *node_parent(left_child) = table->root_page_num;
+  *node_parent(right_child) = table->root_page_num;
+}
+
+void update_internal_node_key(void* node, uint32_t old_key, uint32_t new_key){
+  uint32_t old_child_index = internal_node_find_child(node, old_key);
+  *internal_node_key(node, old_child_index) = new_key;
+}
+
+//b数节点分裂
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value){
   void* old_node = get_page(cursor->table->pager, cursor->page_num);
   uint32_t old_max = get_node_max_key(old_node);
@@ -604,9 +647,35 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value){
       destination_node = old_node;
     }
     uint32_t index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT;
-    void* destination_node = leaf_node_cell(destination_node, index_within_node);
+    void* destination = leaf_node_cell(destination_node, index_within_node);
 
-    
+    //使cell顺序排列，如果cell_num正好找到则赋值
+    //否则移动除该位置，类似于顺序排序的数组插入
+    if(i == cursor->cell_num){
+      serialize_row(value, leaf_node_value(destination_node, index_within_node));
+      *leaf_node_key(destination_node, index_within_node) = key;
+    }else if(i > cursor->cell_num){
+      memcpy(destination, leaf_node_cell(old_node, i - 1), LEAF_NODE_CELL_SIZE);
+    }else{
+      memcpy(destination, leaf_node_cell(old_node, i), LEAF_NODE_CELL_SIZE);
+    }
+
+    *(leaf_node_num_cells(old_node)) = LEAF_NODE_LEFT_SPLIT_COUNT;
+    *(leaf_node_num_cells(new_node)) = LEAF_NODE_RIGHT_SPLIT_COUNT;
+
+    if(is_node_root(old_node)){
+      return create_new_root(cursor->table, new_page_num);
+    }else {
+      uint32_t parent_page_num = *node_parent(old_node);
+      uint32_t new_max = get_node_max_key(old_node);
+      void * parent = get_page(cursor->table->pager, parent_page_num);
+
+      update_internal_node_key(parent, old_max, new_max); 
+    }
+
+
+
+
 
   }
 
@@ -636,7 +705,7 @@ ExecuteResult execute_insert(Statement* statement, Table* table){
   //插入的key已经存在
   if(cursor->cell_num < num_cells){
     uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
-    if(key_at_index === key_to_insert){
+    if(key_at_index == key_to_insert){
       return EXECUTE_DUPLICATE_KEY;
     }
   }
