@@ -366,6 +366,8 @@ uint32_t* internal_node_right_child(void* node){
   return node + INTERNAL_NODE_RIGHT_CHILD_OFFSET;
 }
 
+//中间节点最多为3个key
+//返回
 uint32_t* internal_node_cell(void* node , uint32_t cell_num){
   return node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE;
 }
@@ -489,6 +491,166 @@ PrepareResult prepare_statement(InputBuffer * input_buffer, Statement* statement
   return PREPARE_UNRECOGNIZE_STATEMENT;
 } 
 
+//找到叶子节点后,节点信息必然在叶子结点上
+//用二分法查找cell
+Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key){
+  void* node = get_page(table->pager, page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+
+  Cursor* cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->page_num = page_num;
+  cursor->end_of_table = false;
+
+  uint32_t min_index = 0;
+  uint32_t one_past_max_index = num_cells;
+  while(one_past_max_index != min_index){
+    uint32_t index = (min_index + one_past_max_index)/2;
+    uint32_t key_at_index = *leaf_node_key(node, index);
+    if(key == key_at_index){
+      cursor->cell_num = index;
+      return cursor;
+    }
+    if(key < key_at_index){
+      one_past_max_index = index;
+    }else {
+      min_index = index+1;
+    }
+  }
+
+  cursor->cell_num = min_index;
+  return cursor;
+}
+
+//返回子节点索引位置
+uint32_t internal_node_find_child(void* node, uint32_t key){
+  uint32_t num_keys = *internal_node_num_keys(node);
+
+  uint32_t min_index = 0;
+  uint32_t max_index = num_keys;
+  
+  while(min_index != max_index){
+    uint32_t index = (min_index + max_index )/2;
+    uint32_t key_to_right = *internal_node_key(node, index);
+    if(key_to_right >= key){
+      max_index = index;
+    }else{
+      min_index = index + 1;
+    }
+  }
+
+  return min_index;
+}
+
+//node上child的信息是pager的堆地址索引
+Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key){
+  void* node = get_page(table->pager, page_num);
+
+  uint32_t child_index = internal_node_find_child(node, key);
+  uint32_t child_num = *internal_node_child(node, child_index);
+  void* child = get_page(table->pager, child_num);
+  switch(get_node_type(child)){
+    case NODE_LEAF:
+      return leaf_node_find(table, child_num, key);
+    case NODE_INTERNAL:
+      return internal_node_find(table, child_num, key);
+  }
+}
+
+Cursor* table_find(Table* table, uint32_t key){
+  uint32_t root_page_num = table->root_page_num;
+  void* root_node = get_page(table->pager, root_page_num);
+
+  if(get_node_type(root_node) == NODE_LEAF){
+    return leaf_node_find(table, root_page_num, key);
+  }else{
+    return internal_node_find(table, root_page_num, key);
+  }
+}
+
+//返回最后面的key为最大的key
+uint32_t get_node_max_key(void* node){
+  switch(get_node_type(node)){
+    case NODE_INTERNAL:
+      return *internal_node_key(node, *internal_node_num_keys(node)-1);
+    case NODE_LEAF:
+      return *leaf_node_key(node, *leaf_node_num_cells(node)-1);
+  }
+}
+
+uint32_t get_unused_page_num(Pager* pager){
+  return pager->num_pages;
+}
+
+uint32_t* node_parent(void* node){
+  return node + PARENT_POINTER_OFFSET;
+}
+
+void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value){
+  void* old_node = get_page(cursor->table->pager, cursor->page_num);
+  uint32_t old_max = get_node_max_key(old_node);
+  uint32_t new_page_num = get_unused_page_num(cursor->table->pager);
+  void* new_node = get_page(cursor->table->pager, new_page_num);
+  initialize_leaf_node(new_node);
+  *node_parent(new_node) = *node_parent(old_node);
+  *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
+  *leaf_node_next_leaf(old_node) = new_page_num;
+
+  for(int32_t i = LEAF_NODE_MAX_CELLS; i>=0; i--){
+    void * destination_node;
+    if(i>=LEAF_NODE_LEFT_SPLIT_COUNT){
+      destination_node = new_node;
+    }else{
+      destination_node = old_node;
+    }
+    uint32_t index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT;
+    void* destination_node = leaf_node_cell(destination_node, index_within_node);
+
+    
+
+  }
+
+
+
+
+}
+
+void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value){
+  void * node = get_page(cursor->table->pager, cursor->page_num);
+
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  //分裂
+  if(num_cells > LEAF_NODE_MAX_CELLS){
+    leaf_node_split_and_insert(cursor, key, value);
+  }
+}
+
+ExecuteResult execute_insert(Statement* statement, Table* table){
+  Row* row_to_insert = &(statement->row_to_insert);
+  uint32_t key_to_insert = row_to_insert->id;
+  Cursor* cursor = table_find(table, key_to_insert);
+
+  void * node = get_page(table->pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+
+  //插入的key已经存在
+  if(cursor->cell_num < num_cells){
+    uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+    if(key_at_index === key_to_insert){
+      return EXECUTE_DUPLICATE_KEY;
+    }
+  }
+
+  leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
+}
+
+ExecuteResult execute_statement(Statement* statement , Table* table){
+  switch(statement->type) {
+    case(STATEMENT_INSERT):
+      return execute_insert(statement, table);
+  }
+}
+
 int main(int argc, char * argv[]){
   if(argc < 2){
     printf("Must supply a db filename\n");
@@ -515,7 +677,29 @@ int main(int argc, char * argv[]){
 
     Statement statement;
     switch(prepare_statement(input_buffer, &statement)) {
+      case(PREPARE_SUCCESS):
+        break;
+      case(PREPARE_NEGATIVE_ID):
+        printf("ID MUST BE POSITIVE\n");
+        break;
+      case(PREPARE_STRING_TOO_LONG):
+        printf("string is too long\n");
+        break;
+      case(PREPARE_SYNTAX_ERROR):
+        printf("syntax error\n");
+        break;
+      case(PREPARE_UNRECOGNIZE_STATEMENT):
+        printf("unrecognized command at start of %s .\n", input_buffer->buffer);
+        continue;
+    }
 
+    switch(execute_statement(&statement, table)){
+      case(EXECUTE_SUCCESS):
+        printf("executed.\n");
+        break;
+      case(EXECUTE_DUPLICATE_KEY):
+        printf("error: duplicate key.\n");
+        break;
     }
 
   }
